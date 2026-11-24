@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# Attach a stdio MCP client to one Serena process per project and context.
+# A second client for the same project and context joins the running server.
+# Set SERENA_SHARED=0 to force a private stdio server.
+set -euo pipefail
+
+UV_TOOL_DIR=${UV_TOOL_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/uv/tools}
+REAL_SERENA=${SERENA_BIN:-${UV_TOOL_DIR}/serena-agent/bin/serena}
+if [[ ! -x "$REAL_SERENA" ]]; then
+  REAL_SERENA=$(command -v serena || true)
+fi
+if [[ -z "$REAL_SERENA" || ! -x "$REAL_SERENA" ]]; then
+  echo "serena-shared: could not find serena binary (set SERENA_BIN)" >&2
+  exit 1
+fi
+
+REAL_PYTHON=${SERENA_PYTHON:-$(dirname "$REAL_SERENA")/python}
+if [[ ! -x "$REAL_PYTHON" ]]; then
+  REAL_PYTHON=$(command -v python3 || true)
+fi
+if [[ -z "$REAL_PYTHON" || ! -x "$REAL_PYTHON" ]]; then
+  echo "serena-shared: could not find python binary (set SERENA_PYTHON)" >&2
+  exit 1
+fi
+
+SCRIPT_DIR=$(cd "$(dirname "$(realpath "$0")")" && pwd)
+if [[ -n "${SERENA_SHARED_LIB:-}" ]]; then
+  LIB_DIR=$SERENA_SHARED_LIB
+elif [[ -f "${SCRIPT_DIR}/../lib/proxy.py" ]]; then
+  LIB_DIR="${SCRIPT_DIR}/../lib"
+else
+  LIB_DIR="${HOME}/.local/lib/serena-shared"
+fi
+PROXY="${LIB_DIR}/proxy.py"
+REAPER="${LIB_DIR}/reaper.py"
+
+SHARED_DIR=${SERENA_SHARED_DIR:-${HOME}/.serena/shared}
+PORT_FIRST=${SERENA_SHARED_PORT_FIRST:-29100}
+PORT_LAST=${SERENA_SHARED_PORT_LAST:-29199}
+READY_TIMEOUT=${SERENA_SHARED_READY_TIMEOUT:-240}
+
+context=desktop-app
+project=${SERENA_PROJECT:-}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --context)
+      context=${2:?--context needs a value}
+      shift 2
+      ;;
+    --context=*)
+      context=${1#--context=}
+      shift
+      ;;
+    --project)
+      project=${2:?--project needs a value}
+      shift 2
+      ;;
+    --project=*)
+      project=${1#--project=}
+      shift
+      ;;
+    *)
+      echo "serena-shared: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$context" ]]; then
+  echo "serena-shared: context is empty" >&2
+  exit 2
+fi
+
+find_project_root() {
+  local dir
+  dir=$(pwd -P)
+  while true; do
+    if [[ -f "$dir/.serena/project.yml" || -e "$dir/.git" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    if [[ "$dir" == "/" ]]; then
+      return 1
+    fi
+    dir=$(dirname "$dir")
+  done
+}
+
+private_stdio() {
+  exec "$REAL_SERENA" start-mcp-server --context "$context" --project-from-cwd
+}
+
+if [[ "${SERENA_SHARED:-1}" == "0" ]]; then
+  private_stdio
+fi
+
+if [[ -z "$project" ]]; then
+  project=$(find_project_root || true)
+fi
+
+# No project boundary: a shared server would let unrelated sessions switch
+# each other's active project. Keep the private stdio process for that case.
+if [[ -z "$project" ]]; then
+  private_stdio
+fi
+
+if [[ ! -d "$project" ]]; then
+  echo "serena-shared: project directory does not exist: $project" >&2
+  exit 1
+fi
+project=$(realpath "$project")
+
+# ~/.serena/project.yml would make $HOME a Serena project. Refuse it even if
+# a caller passes --project explicitly.
+if [[ "$project" == "$HOME" ]]; then
+  echo "serena-shared: refusing to index \$HOME" >&2
+  private_stdio
+fi
+
+mkdir -p "$SHARED_DIR/servers" "$SHARED_DIR/logs"
+exec 9>"$SHARED_DIR/lock"
+flock 9
+
+key=$(printf '%s\0%s' "$context" "$project" | sha256sum | awk '{print $1}')
+record="$SHARED_DIR/servers/$key"
+logfile="$SHARED_DIR/logs/$key.log"
+
+port_open() {
+  timeout 0.3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" >/dev/null 2>&1
+}
+
+pid_alive() {
+  [[ -n "${1:-}" ]] && kill -0 "$1" >/dev/null 2>&1
+}
+
+read_record() {
+  port=""
+  pid=""
+  if [[ -f "$record" ]]; then
+    # shellcheck disable=SC1090
+    source "$record"
+  fi
+}
+
+write_record() {
+  cat >"$record" <<EOF
+port=$1
+pid=$2
+context=$(printf '%q' "$context")
+project=$(printf '%q' "$project")
+EOF
+}
+
+pick_port() {
+  local candidate
+  for candidate in $(seq "$PORT_FIRST" "$PORT_LAST"); do
+    if ! port_open "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+wait_until_ready() {
+  local server_pid=$1 ready_port=$2 i
+  for i in $(seq 1 "$READY_TIMEOUT"); do
+    if port_open "$ready_port"; then
+      return 0
+    fi
+    if ! pid_alive "$server_pid"; then
+      echo "serena-shared: Serena exited before it listened on port $ready_port" >&2
+      tail -n 50 "$logfile" >&2 || true
+      return 1
+    fi
+    sleep 1
+  done
+  echo "serena-shared: Serena is still starting for $project ($context); retry this client." >&2
+  return 1
+}
+
+ensure_reaper() {
+  ( setsid "$REAL_PYTHON" "$REAPER" >>"$SHARED_DIR/reaper.log" 2>&1 </dev/null & )
+}
+
+start_server() {
+  local ready_port server_pid
+  ready_port=$(pick_port) || {
+    echo "serena-shared: no free port in $PORT_FIRST-$PORT_LAST" >&2
+    return 1
+  }
+  if [[ -f "$logfile" ]]; then
+    mv -f "$logfile" "${logfile}.prev"
+  fi
+  # Double-fork so Serena is reparented to PID 1 (no zombie under proxy.py),
+  # starts its own process group (pgid == pid for reaper.py killpg), and does
+  # not inherit lock fd 9.
+  server_pid=$("$REAL_PYTHON" -c '
+import os, sys
+try:
+    os.close(9)
+except OSError:
+    pass
+pid = os.fork()
+if pid > 0:
+    os.waitpid(pid, 0)
+    os._exit(0)
+pid2 = os.fork()
+if pid2 > 0:
+    print(pid2, flush=True)
+    os._exit(0)
+os.setsid()
+devnull = os.open(os.devnull, os.O_RDONLY)
+os.dup2(devnull, 0)
+os.close(devnull)
+logfd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+os.dup2(logfd, 1)
+os.dup2(logfd, 2)
+os.close(logfd)
+os.execv(sys.argv[2], sys.argv[2:])
+' "$logfile" \
+    "$REAL_SERENA" start-mcp-server \
+    --transport streamable-http \
+    --host 127.0.0.1 \
+    --port "$ready_port" \
+    --context "$context" \
+    --project "$project" \
+    --enable-web-dashboard false \
+    --open-web-dashboard false)
+  write_record "$ready_port" "$server_pid"
+  touch "$record.activity"
+  wait_until_ready "$server_pid" "$ready_port"
+}
+
+read_record
+if pid_alive "${pid:-}"; then
+  if ! port_open "${port:-0}"; then
+    wait_until_ready "$pid" "$port"
+  fi
+else
+  start_server
+  read_record
+fi
+
+if ! port_open "${port:-0}"; then
+  echo "serena-shared: shared server for $project ($context) is not listening" >&2
+  exit 1
+fi
+
+url="http://127.0.0.1:${port}/mcp"
+touch "$record.activity"
+ensure_reaper
+flock -u 9
+exec 9>&-
+exec "$REAL_PYTHON" "$PROXY" "$url" "$record.activity"
